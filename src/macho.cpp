@@ -128,3 +128,60 @@ macho_find_symbol(kmod_info_t *kmod, const char *symbol)
     /* Silent miss — callers scan many kexts and log once at the top level. */
     return 0;
 }
+
+uint64_t
+macho_find_symbol_by_prefix(kmod_info_t *kmod, const char *prefix)
+{
+    if (!kmod || !prefix) return 0;
+
+    mach_header_64 *hdr = (mach_header_64 *)kmod->address;
+    if (!hdr || hdr->magic != MH_MAGIC_64) return 0;
+
+    symtab_command *symtab = (symtab_command *)find_load_command(hdr, LC_SYMTAB);
+    if (!symtab) return 0;
+
+    uint64_t linkedit_vmaddr = 0, linkedit_fileoff = 0, linkedit_vmsize = 0;
+    bool found_linkedit = false;
+    for_each_segment(hdr, [&](segment_command_64 *seg) {
+        if (!strcmp(seg->segname, "__LINKEDIT")) {
+            linkedit_vmaddr = seg->vmaddr;
+            linkedit_fileoff = seg->fileoff;
+            linkedit_vmsize = seg->vmsize;
+            found_linkedit = true;
+        }
+    });
+    if (!found_linkedit) return 0;
+    if (symtab->symoff < linkedit_fileoff ||
+        symtab->stroff < linkedit_fileoff ||
+        symtab->symoff - linkedit_fileoff > linkedit_vmsize ||
+        symtab->stroff - linkedit_fileoff > linkedit_vmsize) {
+        return 0;
+    }
+
+    nlist_64 *symbols = (nlist_64 *)(linkedit_vmaddr + (symtab->symoff - linkedit_fileoff));
+    const char *strings = (const char *)(linkedit_vmaddr + (symtab->stroff - linkedit_fileoff));
+    uint32_t strsize = symtab->strsize;
+    size_t prefix_len = strlen(prefix);
+
+    uint64_t first_match = 0;
+    const char *first_name = nullptr;
+    int match_count = 0;
+
+    for (uint32_t i = 0; i < symtab->nsyms; i++) {
+        uint32_t strx = symbols[i].n_un.n_strx;
+        if (strx >= strsize) continue;
+        const char *name = strings + strx;
+        if (strncmp(name, prefix, prefix_len) != 0) continue;
+        match_count++;
+        if (match_count == 1) {
+            first_match = symbols[i].n_value;
+            first_name = name;
+        } else if (match_count == 2) {
+            IOLog("%s: prefix '%s' is ambiguous: '%s' + '%s' (pass full mangled name)\n",
+                  kLog, prefix, first_name, name);
+            return 0;
+        }
+    }
+
+    return (match_count == 1) ? first_match : 0;
+}
