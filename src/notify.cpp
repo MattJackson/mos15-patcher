@@ -9,6 +9,8 @@
 #include <libkern/libkern.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
+#include <libkern/c++/OSString.h>
+#include <libkern/c++/OSArray.h>
 
 extern "C" kmod_info_t *kmod;
 
@@ -116,34 +118,126 @@ on_publish(void *target, void *refCon, IOService *newService, IONotifier *notifi
     kmod_info_t *km_fallback = find_kmod("com.apple.iokit.IOGraphicsFamily");
     IOLog("%s: primary kext %p (%s), fallback %p (IOGraphicsFamily)\n",
           kLog, km, km ? km->name : "nil", km_fallback);
-    auto resolve = [&](const char *sym) -> uint64_t {
+    /* Diagnostic encoding: one char per route into a fixed buffer, then ONE
+     * line summarizing all routes, plus up to 3 lines naming the unpatched
+     * symbols. The earlier 40-line burst appeared to overflow the kernel
+     * message buffer during the publish callback — even the pre-existing
+     * on_publish IOLogs got dropped. Keep this quiet. */
+    /* Resolver tries EXACT match first, then falls back to PREFIX match.
+     * Prefix match accepts names that end with 'E' (Itanium C++ ABI nested-name
+     * delimiter) so consumers can pass just "class::method" without paramSig.
+     * The typedef-vs-underlying-type footgun goes away. */
+    enum class ResolveWhere { Unresolved, Primary, Fallback };
+    auto resolve = [&](const char *sym, ResolveWhere &where) -> uint64_t {
         uint64_t a = macho_find_symbol(km, sym);
-        if (a) return a;
+        if (a) { where = ResolveWhere::Primary; return a; }
         if (km_fallback && km_fallback != km) {
             a = macho_find_symbol(km_fallback, sym);
-            if (a) return a;
+            if (a) { where = ResolveWhere::Fallback; return a; }
         }
+        size_t len = strlen(sym);
+        if (len > 0 && sym[len - 1] == 'E') {
+            a = macho_find_symbol_by_prefix(km, sym);
+            if (a) { where = ResolveWhere::Primary; return a; }
+            if (km_fallback && km_fallback != km) {
+                a = macho_find_symbol_by_prefix(km_fallback, sym);
+                if (a) { where = ResolveWhere::Fallback; return a; }
+            }
+        }
+        where = ResolveWhere::Unresolved;
         return 0;
     };
 
+    /* per-route status chars: P=primary+patched, F=fallback+patched,
+     * u=primary+no-slot, f=fallback+no-slot, X=unresolved. */
+    char status[64];
+    bzero(status, sizeof(status));
+    int n = st->route_count;
+    if (n > 60) n = 60;
+
     int patched = 0;
-    for (int i = 0; i < st->route_count; i++) {
+    for (int i = 0; i < n; i++) {
         auto &r = st->routes[i];
-        uint64_t method_addr = resolve(r.method_mangled);
-        if (!method_addr) continue;
+        ResolveWhere where = ResolveWhere::Unresolved;
+        uint64_t method_addr = resolve(r.method_mangled, where);
+        if (!method_addr) { status[i] = 'X'; continue; }
+        bool slot_found = false;
         for (size_t s = 0; s < COPY_BYTES / sizeof(void *); s++) {
             if (new_vtable[s] == (void *)method_addr) {
                 *r.org = new_vtable[s];
                 new_vtable[s] = r.replacement;
                 patched++;
+                slot_found = true;
                 break;
             }
         }
+        status[i] = slot_found
+            ? (where == ResolveWhere::Primary ? 'P' : 'F')
+            : (where == ResolveWhere::Primary ? 'u' : 'f');
     }
 
     *(void ***)newService = new_vtable;
-    IOLog("%s: vtable swap installed for instance %p (%d/%d routes patched)\n",
-          kLog, newService, patched, st->route_count);
+
+    /* Real stats: routes are registered in derived/base pairs by the caller
+     * (QDP's ROUTE() macro). For each pair, only ONE route should actually
+     * patch a vtable slot — the derived class's override wins; the base
+     * entry is a fallback for methods NOT overridden. So the true method
+     * coverage is: "how many pairs had at least one P/F?" */
+    int methods_total    = st->route_count / 2;
+    int methods_hooked   = 0;
+    int routes_redundant = 0;  /* resolved but slot already taken */
+    int routes_unresolved = 0; /* symbol not found anywhere */
+
+    /* Pretty status: "Pf Pf Pf XX Pf..." — space between pairs. */
+    char pretty[128];
+    int po = 0;
+    for (int i = 0; i < n; i++) {
+        if (status[i] == 'u' || status[i] == 'f') routes_redundant++;
+        if (status[i] == 'X') routes_unresolved++;
+        if (po < (int)sizeof(pretty) - 3) {
+            pretty[po++] = status[i];
+            if (i % 2 == 1) pretty[po++] = ' ';
+        }
+    }
+    pretty[po] = 0;
+
+    for (int m = 0; m < methods_total && m * 2 + 1 < n; m++) {
+        char a = status[m * 2], b = status[m * 2 + 1];
+        if (a == 'P' || a == 'F' || b == 'P' || b == 'F') methods_hooked++;
+    }
+    int methods_missing = methods_total - methods_hooked;
+
+    IOLog("%s: methods %d/%d hooked, %d gap, routes P=%d f=%d X=%d [%s]\n",
+          kLog, methods_hooked, methods_total, methods_missing,
+          patched, routes_redundant, routes_unresolved, pretty);
+
+    /* Durable diagnostic via IOService properties — readable from userspace
+     * with `ioreg -c IONDRVFramebuffer -l`. Bypasses the kernel log stream
+     * which has been silently dropping on_publish IOLog output. */
+    newService->setProperty("MPStatus",          pretty);
+    newService->setProperty("MPMethodsHooked",   (unsigned long long)methods_hooked,    32);
+    newService->setProperty("MPMethodsTotal",    (unsigned long long)methods_total,     32);
+    newService->setProperty("MPMethodsMissing",  (unsigned long long)methods_missing,   32);
+    newService->setProperty("MPRoutesPatched",   (unsigned long long)patched,           32);
+    newService->setProperty("MPRoutesRedundant", (unsigned long long)routes_redundant,  32);
+    newService->setProperty("MPRoutesUnresolved",(unsigned long long)routes_unresolved, 32);
+
+    /* Emit only the TRULY unhooked methods — pairs where neither P nor F. */
+    OSArray *gaps = OSArray::withCapacity(8);
+    if (gaps) {
+        for (int m = 0; m < methods_total && m * 2 + 1 < n; m++) {
+            char a = status[m * 2], b = status[m * 2 + 1];
+            if (a == 'P' || a == 'F' || b == 'P' || b == 'F') continue;
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s | %s",
+                     st->routes[m * 2].method_mangled,
+                     st->routes[m * 2 + 1].method_mangled);
+            OSString *s = OSString::withCString(buf);
+            if (s) { gaps->setObject(s); s->release(); }
+        }
+        newService->setProperty("MPMethodGaps", gaps);
+        gaps->release();
+    }
 
     st->instances_patched++;
     return true;  /* keep notifier active — patch every future instance too */

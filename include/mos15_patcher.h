@@ -85,4 +85,91 @@ int mp_route_addr(uint64_t target_addr, void *replacement, void **org);
 }
 #endif
 
+/*
+ * === Route-construction helpers (C++ only) ==================================
+ *
+ * Write a route table without hand-mangling Itanium C++ ABI parameter
+ * signatures. The symbol you hand to the patcher is just the PREFIX up to
+ * (but including) the 'E' nested-name delimiter:
+ *
+ *      __ZN<N><class><M><method>E
+ *
+ * mos15-patcher's resolver tries exact-match first, then falls back to
+ * prefix-match — so the first symbol starting with that prefix wins. This
+ * kills the whole class of typedef-mangling bugs (e.g. IOPixelAperture being
+ * a typedef for int mangles as 'i', not '15IOPixelAperture').
+ *
+ * Disambiguation: if two overloads share the same prefix the patcher logs
+ * the ambiguity and refuses to resolve — pass the full mangled name via
+ * MP_ROUTE_EXACT() in that case.
+ *
+ * Usage:
+ *
+ *   mp_route_request_t reqs[] = {
+ *       MP_ROUTE_PAIR("IONDRVFramebuffer", "IOFramebuffer",
+ *                     "enableController", patchedEnable, orgEnable),
+ *       MP_ROUTE_PAIR("IONDRVFramebuffer", "IOFramebuffer",
+ *                     "getApertureRange", patchedAperture, orgAperture),
+ *       MP_ROUTE_EXACT("__ZN17IONDRVFramebuffer3fooEii", patchedFoo, orgFoo),
+ *   };
+ */
+#ifdef __cplusplus
+
+#include <libkern/libkern.h>  /* strlen, snprintf */
+
+namespace mp {
+    /* Build "__ZN<len><cls><len><method>E" at compile-ish time.
+     * We do it with a static buffer per call site via a lambda so each
+     * macro expansion gets its own storage. Not thread-safe, but route
+     * tables are built once at kext start. */
+    inline const char *build_prefix(char *buf, size_t sz, const char *cls, const char *method) {
+        /* snprintf exists in the kernel via libkern.h. */
+        snprintf(buf, sz, "__ZN%u%s%u%sE",
+                 (unsigned)strlen(cls), cls,
+                 (unsigned)strlen(method), method);
+        return buf;
+    }
+}
+
+/* Build a single-class route from a class+method name (prefix match). */
+#define MP_ROUTE(cls, method, replacement, org)                                 \
+    []() -> mp_route_request_t {                                                \
+        static char _buf[128];                                                  \
+        return { mp::build_prefix(_buf, sizeof(_buf), (cls), (method)),         \
+                 (void *)(replacement), (void **)&(org) };                      \
+    }()
+
+/* Disambiguated variant — supply an explicit Itanium C++ ABI paramSig
+ * (e.g. "jjjPv", "i", "P24IODisplayModeInformation"). Required when the
+ * method is overloaded; the patcher logs an ambiguity warning if you try
+ * prefix-match on such a symbol. */
+#define MP_ROUTE_SIG(cls, method, sig, replacement, org)                        \
+    []() -> mp_route_request_t {                                                \
+        static char _buf[192];                                                  \
+        snprintf(_buf, sizeof(_buf), "__ZN%u%s%u%sE%s",                         \
+                 (unsigned)strlen(cls), (cls),                                  \
+                 (unsigned)strlen(method), (method), (sig));                    \
+        return { _buf, (void *)(replacement), (void **)&(org) };                \
+    }()
+
+/* Build TWO routes in one entry (derived class + base class), sharing the
+ * same replacement+org. The derived route wins when the derived class
+ * overrides the method; the base route catches methods inherited without
+ * override. Emits as a C99 initializer, so must appear inside an
+ * aggregate-initializer list. */
+#define MP_ROUTE_PAIR(derived_cls, base_cls, method, replacement, org)          \
+    MP_ROUTE((derived_cls), (method), (replacement), (org)),                    \
+    MP_ROUTE((base_cls),    (method), (replacement), (org))
+
+/* Disambiguated pair — for overloaded methods. */
+#define MP_ROUTE_PAIR_SIG(derived_cls, base_cls, method, sig, replacement, org) \
+    MP_ROUTE_SIG((derived_cls), (method), (sig), (replacement), (org)),         \
+    MP_ROUTE_SIG((base_cls),    (method), (sig), (replacement), (org))
+
+/* Full mangled-name escape hatch for when neither of the above fits. */
+#define MP_ROUTE_EXACT(mangled_symbol, replacement, org)                        \
+    mp_route_request_t{ (mangled_symbol), (void *)(replacement), (void **)&(org) }
+
+#endif /* __cplusplus */
+
 #endif /* MOS15_PATCHER_H */
