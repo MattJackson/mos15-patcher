@@ -1,33 +1,29 @@
 /*
- * mos15-patcher — public API
+ * mos15-patcher — public API.
  *
- * Minimal kernel-function-hook framework for macOS. Lilu replacement for
- * the mos15 project. Three jobs: detect kext loads, look up Mach-O symbols
- * by mangled name, patch function prologues with trampolines.
+ * Two patching strategies:
  *
- * Usage from a consumer kext (e.g. QEMUDisplayPatcher):
+ *   A. VTABLE PATCHING (preferred for C++ virtual methods)
+ *      Find the class vtable, scan for the method address, swap with your
+ *      replacement. No prologue rewrite, no trampoline, no RIP-rel issues.
+ *      "Original" is just the saved old vtable pointer.
  *
- *   1. Add com.docker-macos.kext.mos15Patcher to OSBundleLibraries in
- *      your Info.plist.
- *   2. From your IOService::start() (or earlier), register routes:
+ *   B. PROLOGUE PATCHING (for static functions / non-virtual methods)
+ *      Overwrite the function's first ~14 bytes with an absolute JMP to
+ *      your replacement. Displaced bytes go in a trampoline that ends with
+ *      a JMP back to (target + N). RIP-relative instructions in the
+ *      displaced bytes are auto-rewritten for the new address.
  *
- *        static IOReturn (*orgEnableController)(void *) = nullptr;
- *        static IOReturn patchedEnableController(void *that) {
- *            IOReturn r = orgEnableController(that);
- *            // ... your code ...
- *            return r;
- *        }
+ * Two delivery mechanisms:
  *
- *        mp_route_request_t reqs[] = {
- *            { "__ZN17IONDRVFramebuffer16enableControllerEv",
- *              (void *)patchedEnableController,
- *              (void **)&orgEnableController },
- *        };
- *        mp_route_kext("com.apple.iokit.IONDRVSupport", reqs, 1);
+ *   1. mp_route_kext — auto-pick A or B based on whether the symbol is
+ *      found in any class's vtable. If the kext isn't loaded yet, requests
+ *      are queued and applied when it loads.
  *
- *   3. mp_route_kext returns immediately. If the target kext is already
- *      loaded, it patches synchronously. If not, it queues the routes for
- *      patching when the kext loads later.
+ *   2. mp_route_on_publish — register an IOService publish notification.
+ *      When macOS creates an instance of the named class, we patch its
+ *      vtable. Apple's blessed kext-arrival API; no kernel-text writes.
+ *      Always uses strategy A (vtable patching).
  */
 #ifndef MOS15_PATCHER_H
 #define MOS15_PATCHER_H
@@ -41,35 +37,49 @@ extern "C" {
 #endif
 
 typedef struct mp_route_request {
-    const char *symbol;       /* mangled symbol name, e.g. "__ZN17IONDRVFramebuffer..." */
-    void       *replacement;  /* your patched function — same signature as target */
-    void      **org;          /* set by mp_route to a trampoline that calls the original */
+    const char *symbol;       /* mangled symbol name */
+    void       *replacement;  /* your hook */
+    void      **org;          /* set to original (vtable ptr or trampoline addr) */
 } mp_route_request_t;
 
 /*
- * Register routes on a target kext.
- *  - kext_bundle_id: e.g. "com.apple.iokit.IONDRVSupport"
- *  - reqs / count: array of routes to apply
+ * Preferred path for patching IOService classes.
  *
- * If the target kext is already loaded, patches are applied immediately and
- * *req->org is filled before this function returns.
+ *   class_name   : C++ class name (UNMANGLED, e.g. "IONDRVFramebuffer")
+ *   reqs         : array of routes; reqs[i].symbol is the mangled method name
  *
- * If the target kext is not yet loaded, the request is queued. When the kext
- * loads later, patches are applied and *req->org is filled at that time.
+ * Registers an IOService publish notification. When a matching instance is
+ * created, walks its vtable and patches the slots for each route. Always
+ * vtable patching — no trampolines.
  *
- * Returns 0 on success (immediate patch), 1 on queued, negative on error.
+ * Returns 0 on success (notifier registered), negative on error.
+ */
+int mp_route_on_publish(const char *class_name,
+                        const char *kext_bundle_id,
+                        mp_route_request_t *reqs,
+                        size_t count);
+
+/*
+ * Auto-dispatch route registration on a kext.
+ *
+ *   kext_bundle_id : e.g. "com.apple.iokit.IONDRVSupport"
+ *
+ * For each route: look up the symbol's address in the kext, check if it's
+ * a vtable slot in any class — if yes, vtable patch; if no, prologue patch.
+ * If the kext isn't loaded, requests are queued for when it loads.
+ *
+ * Returns 0 on immediate success, 1 on queued, negative on error.
  */
 int mp_route_kext(const char *kext_bundle_id,
                   mp_route_request_t *reqs,
                   size_t count);
 
 /*
- * Patch a single function at a known kernel address. Lower-level than
- * mp_route_kext — useful when you've already found the address yourself.
+ * Lower-level: prologue-patch a function at a known runtime address.
+ * For when you've already done your own symbol lookup. Builds a trampoline,
+ * rewrites RIP-relative offsets, installs an absolute JMP at the target.
  */
-int mp_route_addr(uint64_t target_addr,
-                  void     *replacement,
-                  void    **org);
+int mp_route_addr(uint64_t target_addr, void *replacement, void **org);
 
 #ifdef __cplusplus
 }

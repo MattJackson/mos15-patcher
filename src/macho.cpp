@@ -62,82 +62,69 @@ macho_find_symbol(kmod_info_t *kmod, const char *symbol)
     if (!kmod || !symbol) return 0;
 
     mach_header_64 *hdr = (mach_header_64 *)kmod->address;
-    if (hdr->magic != MH_MAGIC_64) {
-        IOLog("%s: bad magic 0x%x at kmod %s\n", kLog, hdr->magic, kmod->name);
-        return 0;
-    }
+    if (!hdr || hdr->magic != MH_MAGIC_64) return 0;
 
     symtab_command *symtab = (symtab_command *)find_load_command(hdr, LC_SYMTAB);
-    if (!symtab) {
-        IOLog("%s: no LC_SYMTAB in %s\n", kLog, kmod->name);
+    if (!symtab) return 0;
+
+    /*
+     * The kernel and any runtime-loaded mach-o image can be interpreted two
+     * ways for symtab access:
+     *   (A) Standalone: symoff/stroff are byte offsets from the mach header
+     *       itself. Works when the file was loaded contiguously into memory
+     *       (typical for the kernel and individual kexts).
+     *   (B) KC-embedded: symoff/stroff are file offsets from the parent
+     *       collection's start; the actual runtime addresses are reached via
+     *       __LINKEDIT's vmaddr/fileoff delta. (System KC kexts.)
+     *
+     * Earlier we tried to PICK between (A) and (B) using a heuristic on the
+     * first symbol's name. That mis-classified the kernel. New approach: try
+     * BOTH and return whichever actually finds the symbol.
+     */
+
+    /*
+     * Unified interpretation via __LINKEDIT:
+     *   symbols = linkedit.vmaddr + (symtab.symoff - linkedit.fileoff)
+     *   strings = linkedit.vmaddr + (symtab.stroff - linkedit.fileoff)
+     *
+     * This works for BOTH standalone mach-o (where hdr = linkedit.vmaddr -
+     * linkedit.fileoff makes it algebraically equivalent to hdr+symoff)
+     * AND KC-embedded kexts (where hdr has no direct relationship to symtab
+     * offsets because those are KC-relative). No heuristic needed — dropping
+     * the previous "standalone vs KC" split. The __LINKEDIT segment is
+     * guaranteed to exist in every valid mach-o image.
+     */
+    uint64_t linkedit_vmaddr = 0;
+    uint64_t linkedit_fileoff = 0;
+    uint64_t linkedit_vmsize = 0;
+    bool found_linkedit = false;
+    for_each_segment(hdr, [&](segment_command_64 *seg) {
+        if (!strcmp(seg->segname, "__LINKEDIT")) {
+            linkedit_vmaddr = seg->vmaddr;
+            linkedit_fileoff = seg->fileoff;
+            linkedit_vmsize = seg->vmsize;
+            found_linkedit = true;
+        }
+    });
+    if (!found_linkedit) return 0;
+    if (symtab->symoff < linkedit_fileoff ||
+        symtab->stroff < linkedit_fileoff ||
+        symtab->symoff - linkedit_fileoff > linkedit_vmsize ||
+        symtab->stroff - linkedit_fileoff > linkedit_vmsize) {
         return 0;
     }
 
-    /*
-     * Standalone Mach-O interpretation: symoff and stroff are file offsets
-     * from hdr. In a runtime-loaded kext, the file == in-memory image, so
-     * these offsets are valid as-is.
-     *
-     * KC-embedded kext interpretation: symoff is a file offset from the
-     * parent KC's start. We need to find __LINKEDIT and compute the runtime
-     * pointer differently. For now, we try the standalone interpretation
-     * and validate by checking that the first symbol's name string is
-     * within reasonable bounds.
-     */
-    nlist_64 *symbols = (nlist_64 *)((uint8_t *)hdr + symtab->symoff);
-    const char *strings = (const char *)((uint8_t *)hdr + symtab->stroff);
+    nlist_64 *symbols = (nlist_64 *)(linkedit_vmaddr + (symtab->symoff - linkedit_fileoff));
+    const char *strings = (const char *)(linkedit_vmaddr + (symtab->stroff - linkedit_fileoff));
+    uint32_t strsize = symtab->strsize;
 
-    /* Validate: first non-empty string should look like a symbol name (start with _) */
-    bool standalone_valid = false;
-    if (symtab->nsyms > 0) {
-        uint32_t strx = symbols[0].n_un.n_strx;
-        if (strx < symtab->strsize && strings[strx] != '\0') {
-            const char *first_name = strings + strx;
-            standalone_valid = (first_name[0] == '_' || first_name[0] == '.' ||
-                               (first_name[0] >= 'a' && first_name[0] <= 'z') ||
-                               (first_name[0] >= 'A' && first_name[0] <= 'Z'));
-        }
-    }
-
-    if (!standalone_valid) {
-        /*
-         * Fall back to KC-embedded interpretation: walk segments to find
-         * __LINKEDIT, use its (vmaddr - fileoff) as the file→VA delta, then
-         * read symtab from (vmaddr_of_LINKEDIT + symoff - fileoff_of_LINKEDIT).
-         *
-         * In Apple's KC format, the kext's __LINKEDIT vmaddr points into
-         * the parent KC's combined __LINKEDIT segment.
-         */
-        uint64_t linkedit_vmaddr = 0;
-        uint64_t linkedit_fileoff = 0;
-        bool found_linkedit = false;
-        for_each_segment(hdr, [&](segment_command_64 *seg) {
-            if (!strcmp(seg->segname, "__LINKEDIT")) {
-                linkedit_vmaddr = seg->vmaddr;
-                linkedit_fileoff = seg->fileoff;
-                found_linkedit = true;
-            }
-        });
-
-        if (!found_linkedit) {
-            IOLog("%s: %s: standalone symtab invalid AND no __LINKEDIT — bailing\n",
-                  kLog, kmod->name);
-            return 0;
-        }
-
-        symbols = (nlist_64 *)(linkedit_vmaddr + (symtab->symoff - linkedit_fileoff));
-        strings = (const char *)(linkedit_vmaddr + (symtab->stroff - linkedit_fileoff));
-    }
-
-    /* Linear scan. No hash table — simple for now. */
     for (uint32_t i = 0; i < symtab->nsyms; i++) {
         uint32_t strx = symbols[i].n_un.n_strx;
-        if (strx >= symtab->strsize) continue;
+        if (strx >= strsize) continue;
         const char *name = strings + strx;
-        if (!strcmp(name, symbol)) {
-            return symbols[i].n_value;
-        }
+        if (!strcmp(name, symbol)) return symbols[i].n_value;
     }
 
+    /* Silent miss — callers scan many kexts and log once at the top level. */
     return 0;
 }

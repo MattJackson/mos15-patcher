@@ -20,10 +20,129 @@
 #include <IOKit/IOLib.h>
 
 extern "C" {
-    /* Kernel-internal vm_protect via map. We need read-write access to the
-     * code page during patching. */
+    /* Kernel-internal vm_protect via map. Used for trampoline pages
+     * (allocated via IOMallocAligned) — works fine. */
     extern vm_map_t kernel_map;
     extern kern_return_t vm_protect(vm_map_t, vm_offset_t, vm_size_t, boolean_t, vm_prot_t);
+}
+
+/*
+ * Kernel-text writes: the kernel marks its __TEXT pages read-only and
+ * vm_protect can't override that on Sequoia. Standard trick: temporarily
+ * clear the WP (Write Protect) bit in CR0 — that disables supervisor-mode
+ * read-only enforcement, letting us write. Restore CR0 afterward.
+ *
+ * Disable interrupts during the window so a context switch / preempt won't
+ * leave us with WP=0.
+ */
+static inline uintptr_t cr0_read() {
+    uintptr_t v;
+    __asm__ volatile ("movq %%cr0, %0" : "=r"(v));
+    return v;
+}
+static inline void cr0_write(uintptr_t v) {
+    __asm__ volatile ("movq %0, %%cr0" :: "r"(v) : "memory");
+}
+#define CR0_WP_BIT (1ULL << 16)
+
+/* Exposed under a stable C name for vtable.cpp etc. */
+extern "C" void wp_write_kernel_bytes(uint8_t *dst, const uint8_t *src, size_t n) {
+    boolean_t intr = ml_set_interrupts_enabled(FALSE);
+    uintptr_t cr0 = cr0_read();
+    cr0_write(cr0 & ~CR0_WP_BIT);
+    memcpy(dst, src, n);
+    cr0_write(cr0);
+    ml_set_interrupts_enabled(intr);
+}
+
+#define write_kernel_bytes wp_write_kernel_bytes
+
+/*
+ * Rewrite RIP-relative offsets in a displaced instruction copied to the
+ * trampoline. x86_64 RIP-relative addressing: ModR/M byte with mod=00,
+ * rm=101. The 32-bit displacement that follows is relative to RIP =
+ * address of next instruction.
+ *
+ *   src   = original instruction bytes (at original address)
+ *   dst   = copy at new (trampoline) address
+ *   len   = instruction length
+ *   delta = original_addr - trampoline_addr (signed)
+ *
+ * For an instruction at original_addr with disp32 D referencing target
+ * T = original_addr + insn_len + D, the same instruction at trampoline_addr
+ * needs disp32 D' such that trampoline_addr + insn_len + D' == T.
+ * Solving: D' = D + (original_addr - trampoline_addr) = D + delta.
+ *
+ * If D + delta overflows int32_t, we have a problem — trampoline is too
+ * far from original. Caller should detect and fail.
+ */
+static int rip_rel_offset_index(const uint8_t *insn, int insn_len, int *disp_off);
+extern "C" int patch_relocate_insn(uint8_t *dst, const uint8_t *src,
+                                   int insn_len, int64_t delta);
+int patch_relocate_insn(uint8_t *dst, const uint8_t *src, int insn_len, int64_t delta)
+{
+    int disp_off = 0;
+    int idx = rip_rel_offset_index(src, insn_len, &disp_off);
+    memcpy(dst, src, insn_len);
+    if (idx < 0) return 0;  /* not RIP-relative — straight copy is fine */
+
+    int32_t orig_disp = *(int32_t *)(src + disp_off);
+    int64_t new_disp64 = (int64_t)orig_disp + delta;
+    if (new_disp64 > INT32_MAX || new_disp64 < INT32_MIN) {
+        return -1;  /* trampoline too far from original */
+    }
+    *(int32_t *)(dst + disp_off) = (int32_t)new_disp64;
+    return 1;
+}
+
+/* Locate the disp32 inside an instruction if it's RIP-relative.
+ * Returns 1 + sets *disp_off to byte offset within instruction; -1 if not RIP-rel. */
+static int rip_rel_offset_index(const uint8_t *insn, int insn_len, int *disp_off)
+{
+    int p = 0;
+
+    /* Skip legacy prefixes */
+    while (p < 4) {
+        uint8_t b = insn[p];
+        if (b == 0x66 || b == 0x67 || b == 0xf0 || b == 0xf2 || b == 0xf3 ||
+            b == 0x26 || b == 0x2e || b == 0x36 || b == 0x3e || b == 0x64 ||
+            b == 0x65) { p++; continue; }
+        break;
+    }
+
+    /* REX prefix */
+    if ((insn[p] & 0xf0) == 0x40) p++;
+
+    uint8_t op = insn[p++];
+
+    /* Opcodes with no ModR/M: nothing to relocate */
+    if ((op >= 0x50 && op <= 0x5f) ||  /* push/pop reg */
+        op == 0xc3 || op == 0xc9 ||    /* ret / leave */
+        (op >= 0xb8 && op <= 0xbf)) {  /* mov r64, imm64 */
+        return -1;
+    }
+
+    /* 0F escape — handle 0F 1F (multibyte nop) — has ModR/M but rare to be RIP-rel */
+    if (op == 0x0f) {
+        op = insn[p++];
+        /* fall through to ModR/M handling */
+    }
+
+    /* All remaining ops here have a ModR/M byte at insn[p]. */
+    if (p >= insn_len) return -1;
+    uint8_t modrm = insn[p++];
+    uint8_t mod = modrm >> 6;
+    uint8_t rm  = modrm & 7;
+
+    /* RIP-relative is mod==00 && rm==101 (no SIB; disp32 follows directly) */
+    if (mod == 0 && rm == 5) {
+        /* disp32 starts at p */
+        if (p + 4 > insn_len) return -1;
+        *disp_off = p;
+        return 1;
+    }
+
+    return -1;
 }
 
 static const char *kLog = "mp:patch";
@@ -133,25 +252,35 @@ static void write_abs_jmp(uint8_t *dst, uint64_t target)
     *(uint64_t *)(dst + 6) = target;
 }
 
-/* Allocate executable kernel memory big enough for one trampoline.
- * Returns a kernel virtual address with R+W+X. */
-static uint8_t *
-alloc_trampoline_page()
-{
-    /* IOMallocAligned gives us page-aligned RW memory. We then bump to RX. */
-    void *mem = IOMallocAligned(PAGE_SIZE, PAGE_SIZE);
-    if (!mem) return nullptr;
-    bzero(mem, PAGE_SIZE);
+/*
+ * Trampoline allocator: hand out slots from a pre-allocated buffer that
+ * lives in our kext's __TEXT segment. __TEXT is mapped RX by the kext
+ * loader, which is exactly what we need. Writing to it requires the
+ * WP-toggle trick (same as patching kernel text).
+ *
+ * 64 slots * 48 bytes each — plenty for 18+ routes. Each trampoline needs
+ * room for displaced bytes (max 32) + a 14-byte JMP back = 46 bytes.
+ *
+ * The `used` attribute keeps the linker from stripping the buffer; the
+ * `section("__TEXT,__cstring")` placement puts it in __TEXT so the page is RX
+ * (we can't easily declare a custom subsection without xcodebuild setup).
+ */
+#define TRAMP_SLOTS 64
+#define TRAMP_SIZE  48
 
-    /* Make it executable. Default IOMalloc memory is RW only. */
-    kern_return_t kr = vm_protect(kernel_map, (vm_offset_t)mem, PAGE_SIZE,
-                                  FALSE, VM_PROT_READ | VM_PROT_EXECUTE | VM_PROT_WRITE);
-    if (kr != KERN_SUCCESS) {
-        IOLog("%s: vm_protect(RX) failed kr=%d\n", kLog, kr);
-        IOFreeAligned(mem, PAGE_SIZE);
+__attribute__((used, section("__TEXT,__cstring")))
+static uint8_t gTrampPool[TRAMP_SLOTS * TRAMP_SIZE] = { 0xcc };  /* int3 fill */
+
+static int gNextTramp = 0;
+
+static uint8_t *
+alloc_tramp_slot()
+{
+    if (gNextTramp >= TRAMP_SLOTS) {
+        IOLog("%s: trampoline pool exhausted (%d slots)\n", kLog, TRAMP_SLOTS);
         return nullptr;
     }
-    return (uint8_t *)mem;
+    return &gTrampPool[gNextTramp++ * TRAMP_SIZE];
 }
 
 int
@@ -168,32 +297,40 @@ patch_route(uint64_t target_addr, void *replacement, void **org)
         return -2;
     }
 
-    /* 2. Allocate trampoline: displaced bytes + 14-byte JMP back. */
-    uint8_t *tramp = alloc_trampoline_page();
+    /* 2. Allocate trampoline slot from our __TEXT pool (RX). Build the
+     *    trampoline contents in a stack buffer, then WP-toggle-write to the
+     *    slot (since __TEXT is read-only from the supervisor's normal view). */
+    uint8_t *tramp = alloc_tramp_slot();
     if (!tramp) return -3;
 
-    memcpy(tramp, target, displ);
-    write_abs_jmp(tramp + displ, target_addr + displ);
+    /* Build trampoline contents in scratch, with RIP-rel offsets rewritten
+     * for the new (trampoline) address. */
+    uint8_t scratch[TRAMP_SIZE];
+    int64_t delta = (int64_t)target_addr - (int64_t)tramp;
+    int p = 0;
+    while (p < displ) {
+        int n = x86_insn_length(target + p);
+        if (n == 0) {
+            IOLog("%s: bad insn at offset %d while relocating\n", kLog, p);
+            return -5;
+        }
+        if (patch_relocate_insn(scratch + p, target + p, n, delta) < 0) {
+            IOLog("%s: RIP-rel offset overflow at offset %d (delta=0x%llx)\n",
+                  kLog, p, (long long)delta);
+            return -6;
+        }
+        p += n;
+    }
+    write_abs_jmp(scratch + displ, target_addr + displ);
+    write_kernel_bytes(tramp, scratch, displ + ABS_JMP_LEN);
 
     if (org) *org = tramp;
 
-    /* 3. Make the target page writable, install our JMP, restore. */
-    vm_offset_t page = (vm_offset_t)target & ~(PAGE_SIZE - 1);
-    /* The target may straddle two pages (rare for prologues, but possible). */
-    vm_size_t span = PAGE_SIZE * 2;
-
-    kern_return_t kr = vm_protect(kernel_map, page, span, FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) {
-        IOLog("%s: vm_protect(RWX) failed kr=%d\n", kLog, kr);
-        return -4;
-    }
-
-    write_abs_jmp(target, (uint64_t)replacement);
-
-    /* Restore RX (no W). */
-    vm_protect(kernel_map, page, span, FALSE,
-               VM_PROT_READ | VM_PROT_EXECUTE);
+    /* 3. Build the JMP into a local buffer, then write it to the target via
+     *    the WP-bit-toggle trick (vm_protect is unreliable on kernel __TEXT). */
+    uint8_t jmp_bytes[ABS_JMP_LEN];
+    write_abs_jmp(jmp_bytes, (uint64_t)replacement);
+    write_kernel_bytes(target, jmp_bytes, ABS_JMP_LEN);
 
     IOLog("%s: routed 0x%llx -> %p (trampoline %p, displaced %d bytes)\n",
           kLog, target_addr, replacement, tramp, displ);

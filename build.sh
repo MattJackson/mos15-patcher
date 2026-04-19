@@ -28,17 +28,18 @@ CFLAGS=(
 )
 
 echo "=== compile ==="
-$CC  "${CFLAGS[@]}"  -c src/kmod_info.c -o build/kmod_info.o
-$CXX "${CXXFLAGS[@]}" -c src/macho.cpp  -o build/macho.o
-$CXX "${CXXFLAGS[@]}" -c src/patch.cpp  -o build/patch.o
-$CXX "${CXXFLAGS[@]}" -c src/notify.cpp -o build/notify.o
-$CXX "${CXXFLAGS[@]}" -c src/start.cpp  -o build/start.o
+$CC  "${CFLAGS[@]}"   -c src/kmod_info.c -o build/kmod_info.o
+$CXX "${CXXFLAGS[@]}" -c src/macho.cpp   -o build/macho.o
+$CXX "${CXXFLAGS[@]}" -c src/patch.cpp   -o build/patch.o
+$CXX "${CXXFLAGS[@]}" -c src/vtable.cpp  -o build/vtable.o
+$CXX "${CXXFLAGS[@]}" -c src/notify.cpp  -o build/notify.o
+$CXX "${CXXFLAGS[@]}" -c src/start.cpp   -o build/start.o
 
 echo "=== link ==="
 $CXX -target x86_64-apple-macos10.15 -arch x86_64 -nostdlib \
     -Xlinker -kext -Xlinker -no_data_const -Xlinker -no_source_version \
     -L"$KERN_SDK/Library/x86_64" \
-    build/kmod_info.o build/macho.o build/patch.o build/notify.o build/start.o -lkmod \
+    build/kmod_info.o build/macho.o build/patch.o build/vtable.o build/notify.o build/start.o -lkmod \
     -o "$OUT"
 
 echo "=== done ==="
