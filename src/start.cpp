@@ -11,6 +11,12 @@
 #include <mach/mach_types.h>
 #include <libkern/libkern.h>
 #include <IOKit/IOLib.h>
+#include <kern/thread_call.h>
+
+/* Forward declaration — arm_drain_timer is defined later alongside
+ * the drain_pending machinery, but mp_route_kext (above that block)
+ * needs to invoke it on queue. */
+static void arm_drain_timer(void);
 
 extern "C" kmod_info_t *kmod;
 
@@ -34,9 +40,22 @@ static void cache_kext(kmod_info_t *km) {
 }
 
 static kmod_info_t *find_loaded_kext(const char *bundle_id) {
+    /* Fast path: cache built at mp_start. */
     for (int i = 0; i < loaded_count; i++) {
         if (!strncmp(loaded[i].bundle_id, bundle_id, sizeof(loaded[i].bundle_id)))
             return loaded[i].kmod;
+    }
+    /* Slow path: the kext may have loaded AFTER mp_start (e.g.
+     * AppleParavirtGPU matching a late-enumerated PCI device). Walk
+     * the live kmod chain (the kmod extern is already declared at
+     * file scope above), cache any new entry we find, and return. */
+    int total = 0;
+    for (kmod_info_t *km = kmod; km; km = (kmod_info_t *)km->next) {
+        if (!strncmp(km->name, bundle_id, sizeof(km->name))) {
+            cache_kext(km);
+            return km;
+        }
+        if (++total > 4096) break;
     }
     return nullptr;
 }
@@ -110,8 +129,10 @@ int mp_route_kext(const char *kext_bundle_id,
         p.replacement = reqs[i].replacement;
         p.org = reqs[i].org;
     }
-    IOLog("%s: queued %zu route(s) for %s (kext not yet loaded)\n",
+    IOLog("%s: queued %zu route(s) for %s (kext not yet loaded) — arming drain\n",
           kLog, count, kext_bundle_id);
+    /* Poke the drain timer so we retry as the kext arrives. */
+    arm_drain_timer();
     return 1;
 }
 
@@ -152,12 +173,73 @@ int mp_route_addr(uint64_t target_addr, void *replacement, void **org)
     return patch_route(target_addr, replacement, org);
 }
 
+/*
+ * Drain pending routes. Walk the pending[] queue; for each entry,
+ * check if its kext is now loaded; if yes, apply the route and
+ * remove from queue. Returns the number of routes still pending.
+ *
+ * Safe to call repeatedly — routes already applied stay applied,
+ * new routes can be added between calls.
+ */
+static int drain_pending(void)
+{
+    int kept = 0;
+    for (int i = 0; i < pending_count; i++) {
+        auto &p = pending[i];
+        kmod_info_t *km = find_loaded_kext(p.bundle_id);
+        if (!km) {
+            /* Kext still not loaded — keep pending. */
+            if (kept != i) pending[kept] = p;
+            kept++;
+            continue;
+        }
+        int rc = apply_route(km, p.symbol, p.replacement, p.org);
+        IOLog("%s: drain: %s %s applied (rc=%d)\n",
+              kLog, p.bundle_id, p.symbol, rc);
+        /* Drop whether apply succeeded or failed — either way the
+         * caller's orig function pointer is either set or we can't
+         * do anything more useful. */
+    }
+    pending_count = kept;
+    return kept;
+}
+
+static thread_call_t g_drain_timer = nullptr;
+
+static void arm_drain_timer(void)
+{
+    if (!g_drain_timer) return;
+    uint64_t deadline;
+    clock_interval_to_deadline(500, 1000 * 1000, &deadline);
+    thread_call_enter_delayed(g_drain_timer, deadline);
+}
+
+static void drain_timer_cb(thread_call_param_t, thread_call_param_t)
+{
+    int remaining = drain_pending();
+    if (remaining > 0) {
+        /* More to do — keep polling. */
+        arm_drain_timer();
+    }
+    /* If remaining == 0, just exit. mp_route_kext will re-arm us
+     * on the next queue insertion. */
+}
+
 extern "C"
 kern_return_t mp_start(kmod_info_t *ki, void *d)
 {
     IOLog("%s: mos15-patcher starting\n", kLog);
     enumerate_loaded_kexts(cache_kext);
     IOLog("%s: cached %d already-loaded kexts\n", kLog, loaded_count);
+
+    /* Allocate the drain timer. It stays disarmed until the first
+     * mp_route_kext call that queues a route; that call pokes the
+     * timer, which then polls every 500ms until the queue empties. */
+    g_drain_timer = thread_call_allocate(drain_timer_cb, nullptr);
+    if (!g_drain_timer) {
+        IOLog("%s: failed to allocate drain timer — pending routes won't auto-flush\n", kLog);
+    }
+
     return KERN_SUCCESS;
 }
 
